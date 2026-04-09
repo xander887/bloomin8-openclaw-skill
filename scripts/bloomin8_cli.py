@@ -10,11 +10,11 @@ Features:
 - Get/Set upstream controller settings
 
 Usage:
-    python eink_cli.py info --name "EINK-XXXX"
-    python eink_cli.py info --id "12345678"
-    python eink_cli.py upload --ip 192.168.1.100 --file image.jpg
-    python eink_cli.py upload --name "EINK-XXXX" --file image.jpg --show
-    python eink_cli.py upstream --ip 192.168.1.100
+    python bloomin8_cli.py info --name "EINK-XXXX"
+    python bloomin8_cli.py info --id "12345678"
+    python bloomin8_cli.py upload --ip 192.168.1.100 --file image.jpg
+    python bloomin8_cli.py upload --name "EINK-XXXX" --file image.jpg --show
+    python bloomin8_cli.py upstream --ip 192.168.1.100
 
 Requirements:
     pip install bleak aiohttp pillow
@@ -26,6 +26,7 @@ import json
 import struct
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -94,7 +95,7 @@ def cache_device(name: str, device_id: str, ip: str, screen_w: int, screen_h: in
         "ip": ip,
         "screen_width": screen_w,
         "screen_height": screen_h,
-        "updated": __import__("datetime").datetime.now().isoformat(),
+        "updated": datetime.now().isoformat(),
     }
     save_device_cache(cache)
 
@@ -260,7 +261,7 @@ class EinkDevice:
         """Subscribe to BLE notifications (only once)"""
         if not self._client or not self._client.is_connected:
             return
-        
+
         # Check if already subscribed
         if hasattr(self, '_notifications_subscribed') and self._notifications_subscribed:
             return
@@ -270,7 +271,7 @@ class EinkDevice:
                 json_data = json.loads(data.decode("utf-8").strip())
                 msg_type = json_data.get("msg")
                 print(f"  📡 BLE Notification: {msg_type}")
-                
+
                 if msg_type == "greet" and "data" in json_data:
                     self._device_info = json_data["data"]
                     self._info_received.set()
@@ -527,27 +528,38 @@ async def find_device(name: Optional[str] = None, device_id: Optional[str] = Non
     return None
 
 
-async def cmd_info(args):
-    """Get device info command"""
-    use_json = getattr(args, 'json', False)
-    result = await find_device(name=args.name, device_id=args.id, timeout=args.scan_timeout)
+def _cache_fallback(name: Optional[str], device_id: Optional[str], use_json: bool) -> Optional[dict]:
+    """Try to get device info from cache when BLE fails"""
+    cached = lookup_cached_device(name=name, device_id=device_id)
+    if cached and cached.get("ip"):
+        if not use_json:
+            print(f"⚠️ BLE failed. Using cached info (last updated: {cached.get('updated', 'unknown')})")
+        return {**cached, "ble_info": None, "source": "cache"}
+    return None
+
+
+async def discover_device_ip(
+    name: Optional[str] = None,
+    device_id: Optional[str] = None,
+    scan_timeout: float = 10.0,
+    use_json: bool = False,
+) -> Optional[dict]:
+    """Discover device via BLE scan + wake + getInfo, with cache fallback.
+
+    Returns dict with keys: ip, screen_width, screen_height, device_name,
+    device_id, ble_info (raw notification dict or None), source ("ble" or "cache").
+    Returns None if all discovery methods fail.
+    """
+    result = await find_device(name=name, device_id=device_id, timeout=scan_timeout)
     if not result:
-        # Fallback: check cache
-        cached = lookup_cached_device(name=args.name, device_id=args.id)
-        if cached:
-            if use_json:
-                print(json.dumps({"source": "cache", **cached}))
-            else:
-                print(f"⚠️ BLE discovery failed. Using cached info (last updated: {cached.get('updated', 'unknown')}):")
-                print(json.dumps(cached, indent=2, ensure_ascii=False))
-        return
+        return _cache_fallback(name, device_id, use_json)
 
     ble_device, adv = result
     eink = EinkDevice(ble_device=ble_device)
 
     try:
         if not await eink.connect_ble():
-            return
+            return _cache_fallback(name, device_id, use_json)
 
         await eink.subscribe_notifications()
         await eink.send_wake()
@@ -566,66 +578,91 @@ async def cmd_info(args):
             if info:
                 break
             await asyncio.sleep(2)
-        if info:
-            # Cache the result
-            sta_ip = info.get("sta_ip")
-            screen_w = info.get("w") or info.get("screen_width")
-            screen_h = info.get("h") or info.get("screen_height")
-            dev_name = adv.local_name or info.get("name", "")
-            dev_sn = info.get("sn", "")
-            if sta_ip and screen_w and screen_h:
-                cache_device(dev_name, dev_sn, sta_ip, screen_w, screen_h)
 
-            if use_json:
-                combined = {"source": "ble", "ble": info}
-                if sta_ip:
-                    http_info = await eink.get_device_info_http(sta_ip)
-                    if http_info:
-                        combined["http"] = http_info
-                print(json.dumps(combined))
-            else:
-                print("\n📱 Device Info (BLE):")
-                print(json.dumps(info, indent=2, ensure_ascii=False))
+        if not info:
+            return _cache_fallback(name, device_id, use_json)
 
-                if sta_ip:
-                    print(f"\n🌐 Checking HTTP ({sta_ip})...")
-                    http_info = await eink.get_device_info_http(sta_ip)
-                    if http_info:
-                        print("📱 Device Info (HTTP):")
-                        print(json.dumps(http_info, indent=2, ensure_ascii=False))
-        else:
-            # BLE info failed — try cache fallback
-            cached = lookup_cached_device(name=args.name, device_id=args.id)
-            if cached:
-                if use_json:
-                    print(json.dumps({"source": "cache", **cached}))
-                else:
-                    print(f"⚠️ BLE info failed. Using cached info (last updated: {cached.get('updated', 'unknown')}):")
-                    print(json.dumps(cached, indent=2, ensure_ascii=False))
-            else:
-                if use_json:
-                    print(json.dumps({"error": "failed_to_get_device_info"}))
-                else:
-                    print("❌ Failed to get device info")
+        sta_ip = info.get("sta_ip")
+        screen_w = info.get("w") or info.get("screen_width")
+        screen_h = info.get("h") or info.get("screen_height")
+        dev_name = adv.local_name or info.get("name", "")
+        dev_sn = info.get("sn", "")
+
+        if sta_ip and screen_w and screen_h:
+            cache_device(dev_name, dev_sn, sta_ip, screen_w, screen_h)
+
+        return {
+            "ip": sta_ip,
+            "screen_width": screen_w,
+            "screen_height": screen_h,
+            "device_name": dev_name,
+            "device_id": dev_sn,
+            "ble_info": info,
+            "source": "ble",
+        }
     finally:
         await eink.disconnect_ble()
+
+
+async def cmd_info(args):
+    """Get device info command"""
+    use_json = getattr(args, 'json', False)
+    discovery = await discover_device_ip(
+        name=args.name, device_id=args.id,
+        scan_timeout=args.scan_timeout, use_json=use_json,
+    )
+
+    if not discovery:
+        if use_json:
+            print(json.dumps({"error": "failed_to_get_device_info"}))
+        else:
+            print("❌ Failed to get device info")
+        return
+
+    if discovery["source"] == "cache":
+        if use_json:
+            print(json.dumps({"source": "cache", **{k: v for k, v in discovery.items() if k not in ("ble_info", "source")}}))
+        else:
+            print(json.dumps({k: v for k, v in discovery.items() if k not in ("ble_info", "source")}, indent=2, ensure_ascii=False))
+        return
+
+    # BLE discovery succeeded — show full info
+    info = discovery["ble_info"]
+    sta_ip = discovery["ip"]
+
+    if use_json:
+        combined = {"source": "ble", "ble": info}
+        if sta_ip:
+            http_info = await EinkDevice(ip=sta_ip).get_device_info_http(sta_ip)
+            if http_info:
+                combined["http"] = http_info
+        print(json.dumps(combined))
+    else:
+        print("\n📱 Device Info (BLE):")
+        print(json.dumps(info, indent=2, ensure_ascii=False))
+        if sta_ip:
+            print(f"\n🌐 Checking HTTP ({sta_ip})...")
+            http_info = await EinkDevice(ip=sta_ip).get_device_info_http(sta_ip)
+            if http_info:
+                print("📱 Device Info (HTTP):")
+                print(json.dumps(http_info, indent=2, ensure_ascii=False))
 
 
 async def cmd_upload(args):
     """Upload image command"""
     use_json = getattr(args, 'json', False)
     ip = args.ip
-    eink = EinkDevice(ip=ip)
+    screen_size = None
 
-    # If IP provided directly, skip BLE discovery entirely
+    # --- Resolve IP and screen size ---
     if ip:
-        # Try to get screen size from cache for auto-resize
+        # Direct IP — get screen size from cache or --resize
         if not args.resize:
             cached = lookup_cached_device(name=args.name, device_id=args.id, ip=ip)
             if cached and cached.get("screen_width") and cached.get("screen_height"):
-                eink._screen_size = (cached["screen_width"], cached["screen_height"])
+                screen_size = (cached["screen_width"], cached["screen_height"])
                 if not use_json:
-                    print(f"📐 Using cached screen size: {cached['screen_width']}x{cached['screen_height']}")
+                    print(f"📐 Using cached screen size: {screen_size[0]}x{screen_size[1]}")
             else:
                 if use_json:
                     print(json.dumps({"error": "no_screen_size", "message": "Screen size required. Pass --resize WxH or run 'info' first to cache screen size."}))
@@ -634,89 +671,27 @@ async def cmd_upload(args):
                     print("   Pass --resize WxH or run 'info' first to cache screen size.")
                 return
     else:
-        # No IP — discover via BLE, with cache fallback
-        result = await find_device(name=args.name, device_id=args.id, timeout=args.scan_timeout)
-        if not result:
-            # Fallback to cache
-            cached = lookup_cached_device(name=args.name, device_id=args.id)
-            if cached and cached.get("ip"):
-                ip = cached["ip"]
-                if not use_json:
-                    print(f"⚠️ BLE discovery failed. Falling back to cached IP: {ip} (last updated: {cached.get('updated', 'unknown')})")
-                if cached.get("screen_width") and cached.get("screen_height"):
-                    eink._screen_size = (cached["screen_width"], cached["screen_height"])
+        # BLE discovery path
+        discovery = await discover_device_ip(
+            name=args.name, device_id=args.id,
+            scan_timeout=args.scan_timeout, use_json=use_json,
+        )
+        if not discovery or not discovery.get("ip"):
+            if use_json:
+                print(json.dumps({"error": "device_not_found", "message": "BLE discovery failed and no cached IP available"}))
             else:
-                if use_json:
-                    print(json.dumps({"error": "device_not_found", "message": "BLE discovery failed and no cached IP available"}))
-                return
+                print("❌ Could not find device")
+            return
+        ip = discovery["ip"]
+        if not use_json:
+            print(f"📍 Device IP: {ip}")
+        if discovery.get("screen_width") and discovery.get("screen_height"):
+            screen_size = (discovery["screen_width"], discovery["screen_height"])
+            if not use_json:
+                print(f"📐 Screen size: {screen_size[0]}x{screen_size[1]}")
 
-        if not ip:
-            ble_device, adv = result
-            eink.ble_device = ble_device
-
-            if not await eink.connect_ble():
-                return
-
-            try:
-                await eink.subscribe_notifications()
-                await eink.send_wake()
-                if not use_json:
-                    print("⏳ Waiting for device to wake up (8s)...")
-                await asyncio.sleep(8)
-
-                if not use_json:
-                    print("🔍 Sending getInfo command...")
-                info = None
-                for attempt in range(5):
-                    await eink.send_ble_command({"cmd": "getInfo"})
-                    if not use_json:
-                        print(f"  ⏳ Waiting for response (attempt {attempt + 1}/5)...")
-                    info = await eink.get_info_via_ble(timeout=5.0)
-                    if info:
-                        break
-                    await asyncio.sleep(2)
-
-                if info:
-                    sta_ip = info.get("sta_ip") or info.get("sip")
-                    screen_width = info.get("w") or info.get("screen_width")
-                    screen_height = info.get("h") or info.get("screen_height")
-                    if sta_ip:
-                        ip = sta_ip
-                        if not use_json:
-                            print(f"📍 Device IP: {ip}")
-                        if screen_width and screen_height:
-                            if not use_json:
-                                print(f"📐 Screen size: {screen_width}x{screen_height}")
-                            eink._screen_size = (screen_width, screen_height)
-                        # Cache for future use
-                        dev_name = adv.local_name or info.get("name", "")
-                        dev_sn = info.get("sn", "")
-                        if screen_width and screen_height:
-                            cache_device(dev_name, dev_sn, sta_ip, screen_width, screen_height)
-                    else:
-                        if not use_json:
-                            print("⚠️ No IP in device info")
-                            print(f"  Device info: {json.dumps(info, indent=2)}")
-                        return
-                else:
-                    # BLE info failed — try cache
-                    cached = lookup_cached_device(name=args.name, device_id=args.id)
-                    if cached and cached.get("ip"):
-                        ip = cached["ip"]
-                        if not use_json:
-                            print(f"⚠️ BLE getInfo failed. Falling back to cached IP: {ip}")
-                        if cached.get("screen_width") and cached.get("screen_height"):
-                            eink._screen_size = (cached["screen_width"], cached["screen_height"])
-                    else:
-                        if use_json:
-                            print(json.dumps({"error": "no_device_ip"}))
-                        else:
-                            print("❌ Could not get device info and no cache available")
-                        return
-            finally:
-                await eink.disconnect_ble()
-
-    # Check if device is online with retries
+    # --- Check device online, BLE re-wake if needed ---
+    eink = EinkDevice(ip=ip)
     if not use_json:
         print(f"🔍 Checking device at {ip}...")
     device_online = False
@@ -732,22 +707,23 @@ async def cmd_upload(args):
         if not use_json:
             print("⚠️ Device offline, attempting BLE wake...")
 
-        if not eink.ble_device:
-            result = await find_device(name=args.name, device_id=args.id, timeout=args.scan_timeout)
-            if not result:
-                if use_json:
-                    print(json.dumps({"error": "device_offline", "ip": ip}))
-                else:
-                    print("❌ Cannot find device to wake")
-                return
-            eink.ble_device = result[0]
+        ble_device = None
+        result = await find_device(name=args.name, device_id=args.id, timeout=args.scan_timeout)
+        if not result:
+            if use_json:
+                print(json.dumps({"error": "device_offline", "ip": ip}))
+            else:
+                print("❌ Cannot find device to wake")
+            return
+        ble_device = result[0]
 
-        if await eink.connect_ble():
-            await eink.send_wake()
+        wake_eink = EinkDevice(ble_device=ble_device)
+        if await wake_eink.connect_ble():
+            await wake_eink.send_wake()
             if not use_json:
                 print("⏳ Waiting for device to connect to WiFi (10s)...")
             await asyncio.sleep(10)
-            await eink.disconnect_ble()
+            await wake_eink.disconnect_ble()
 
             for check_attempt in range(3):
                 if await eink.check_device_online(ip, timeout=10):
@@ -766,7 +742,7 @@ async def cmd_upload(args):
             if not use_json:
                 print("✅ Device is now online")
 
-    # Determine resize dimensions
+    # --- Determine resize dimensions ---
     resize = None
     if args.resize:
         try:
@@ -774,12 +750,12 @@ async def cmd_upload(args):
             resize = (w, h)
         except ValueError:
             print(f"⚠️ Invalid resize format: {args.resize}, expected WxH")
-    elif hasattr(eink, '_screen_size') and eink._screen_size:
-        resize = eink._screen_size
+    elif screen_size:
+        resize = screen_size
         if not use_json:
             print(f"📐 Auto-resizing to fit screen: {resize[0]}x{resize[1]}")
 
-    # Upload
+    # --- Upload ---
     show_now = not args.no_show if args.no_show else args.show
     success = await eink.upload_image(
         ip=ip,
@@ -802,29 +778,14 @@ async def cmd_upstream(args):
     ip = args.ip
 
     if not ip:
-        # Find device via BLE
-        result = await find_device(name=args.name, device_id=args.id, timeout=args.scan_timeout)
-        if not result:
+        discovery = await discover_device_ip(
+            name=args.name, device_id=args.id,
+            scan_timeout=args.scan_timeout, use_json=False,
+        )
+        if not discovery or not discovery.get("ip"):
+            print("❌ Could not get device IP")
             return
-
-        ble_device, adv = result
-        eink = EinkDevice(ble_device=ble_device)
-
-        if not await eink.connect_ble():
-            return
-
-        try:
-            await eink.send_wake()
-            await asyncio.sleep(1)
-
-            info = await eink.get_info_via_ble(timeout=5.0)
-            if info and info.get("sta_ip"):
-                ip = info["sta_ip"]
-            else:
-                print("❌ Could not get device IP")
-                return
-        finally:
-            await eink.disconnect_ble()
+        ip = discovery["ip"]
 
     eink = EinkDevice(ip=ip)
 
@@ -835,7 +796,7 @@ async def cmd_upstream(args):
         print(json.dumps(settings, indent=2, ensure_ascii=False))
 
     # Update if any flags provided
-    if any([args.on is not None, args.off is not None, args.token, args.url, args.cron]):
+    if any([args.on, args.off, args.token, args.url, args.cron]):
         upstream_on = None
         if args.on:
             upstream_on = True
@@ -907,25 +868,25 @@ def main():
         epilog="""
 Examples:
   # Scan for nearby devices
-  python eink_cli.py scan
+  python bloomin8_cli.py scan
 
   # Get device info by name
-  python eink_cli.py info --name "EINK-1234"
+  python bloomin8_cli.py info --name "EINK-1234"
 
   # Get device info by device ID
-  python eink_cli.py info --id "12345678"
+  python bloomin8_cli.py info --id "12345678"
 
   # Upload image directly to IP
-  python eink_cli.py upload --ip 192.168.1.100 --file image.jpg --show
+  python bloomin8_cli.py upload --ip 192.168.1.100 --file image.jpg --show
 
   # Upload image by device name (auto BLE wake)
-  python eink_cli.py upload --name "EINK-1234" --file image.jpg --resize 480x800 --show
+  python bloomin8_cli.py upload --name "EINK-1234" --file image.jpg --resize 480x800 --show
 
   # View upstream settings
-  python eink_cli.py upstream --ip 192.168.1.100
+  python bloomin8_cli.py upstream --ip 192.168.1.100
 
   # Enable upstream with token
-  python eink_cli.py upstream --ip 192.168.1.100 --on --token "your-token"
+  python bloomin8_cli.py upstream --ip 192.168.1.100 --on --token "your-token"
         """,
     )
 
