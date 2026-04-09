@@ -1,7 +1,7 @@
 ---
 name: bloomin8
 description: Push images or markdown to a Bloomin8 e-ink photo frame via cloud API (async) or local BLE+LAN (instant). Scan nearby devices, check status, track delivery, change wake schedule, upload directly over WiFi.
-version: 2.2.3
+version: 2.2.5
 metadata: {"openclaw":{"homepage":"https://github.com/xander887/bloomin8-openclaw-skill","requires":{"env":["BLOOMIN8_TOKEN_*"],"bins":["python3","pip"],"pip":["bleak","aiohttp","pillow"]},"primaryEnvPrefix":"BLOOMIN8_TOKEN_","emoji":"🖼️"}}
 ---
 
@@ -346,7 +346,7 @@ No screen size for resize?
 ├─ Check cache: cat ~/.bloomin8/device_cache.json
 ├─ Run info to populate cache: python scripts/bloomin8_cli.py info --name "<name>"
 ├─ Pass explicit size: --resize 480x800 (standard) or --resize 1200x1600 (large)
-└─ Common sizes: 480×800 (7.5"), 1200×1600 (10.3")
+└─ Common sizes: 480×800 (7.3"), 1200×1600 (10.3")
 ```
 
 ### Still Not Working?
